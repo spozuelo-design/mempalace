@@ -36,3 +36,6 @@ venv/
 
 # ChromaDB local data
 *.sqlite3-journal
+
+# Local scratch / one-off scripts (e.g. Cohere rerank smoke test)
+scratch/

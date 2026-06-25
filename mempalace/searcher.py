@@ -9,9 +9,13 @@ weak closets (regex extraction on narrative content) can only help, never
 hide drawers the direct path would have found.
 """
 
+import json
 import logging
 import math
+import os
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
@@ -94,6 +98,99 @@ def _bm25_scores(
     return scores
 
 
+# ── Optional Cohere Rerank step (opt-in, fallback-safe) ──────────────────────
+# Final cross-encoder re-ranking on top of the hybrid order. Disabled by
+# default: only runs when COHERE_RERANK=1 *and* COHERE_API_KEY is present.
+# Any failure (network, timeout, bad payload, missing dep) silently returns the
+# hybrid order unchanged — search must never break because rerank was off or
+# unreachable. See LLMWiki/wiki/automation/Cohere-Rerank-Mempalace-PoC.md.
+_COHERE_RERANK_URL = "https://api.cohere.com/v2/rerank"
+_COHERE_DEFAULT_MODEL = "rerank-v3.5"
+_COHERE_TIMEOUT_S = 5.0
+_COHERE_MAX_CANDIDATES = 30  # cap → 1 search_unit/query; never rerank the whole set
+
+# Anonymize sensitive data before it leaves the machine. Over-redaction is
+# acceptable here — these tokens are only used for relevance scoring, not shown.
+_NIB_RE = re.compile(r"\b\d{15,}\b")
+_AMOUNT_RE = re.compile(r"\d[\d.,]*\s*Kz", re.IGNORECASE)
+
+
+def _anonymize_for_rerank(text: str) -> str:
+    """Strip NIBs and Kz amounts before sending text to Cohere."""
+    text = _NIB_RE.sub("[NIB]", text)
+    text = _AMOUNT_RE.sub("[VALOR]", text)
+    return text
+
+
+def _cohere_rerank_enabled() -> bool:
+    """True only when explicitly opted in via flag *and* a key is configured."""
+    return os.environ.get("COHERE_RERANK", "0") == "1" and bool(
+        os.environ.get("COHERE_API_KEY", "")
+    )
+
+
+def _cohere_rerank(results: list, query: str, top_n: int = _COHERE_MAX_CANDIDATES) -> list:
+    """Re-order the top ``top_n`` hybrid candidates with Cohere Rerank v3.5.
+
+    Opt-in and fallback-safe (pattern mirrors the B8 redaction layer): on any
+    error or when disabled, returns ``results`` unchanged. Only the leading
+    ``top_n`` candidates are sent (one search_unit per query); each is
+    anonymized first. Candidates Cohere drops, plus the untouched tail beyond
+    ``top_n``, are preserved after the reranked block so nothing is lost.
+    """
+    if not results or not _cohere_rerank_enabled():
+        return results
+
+    candidates = results[:top_n]
+    documents = [_anonymize_for_rerank(r.get("text", "")) for r in candidates]
+    if not any(documents):  # nothing rerankable
+        return results
+
+    body = json.dumps(
+        {
+            "model": os.environ.get("COHERE_RERANK_MODEL", _COHERE_DEFAULT_MODEL),
+            "query": _anonymize_for_rerank(query),
+            "documents": documents,
+            "top_n": len(documents),
+        }
+    ).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ['COHERE_API_KEY']}",
+    }
+
+    try:
+        req = urllib.request.Request(_COHERE_RERANK_URL, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=_COHERE_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        logger.debug("Cohere rerank unavailable; keeping hybrid order", exc_info=True)
+        return results
+
+    ranked = payload.get("results")
+    if not ranked:
+        return results
+
+    reordered = []
+    seen = set()
+    for item in ranked:
+        idx = item.get("index")
+        if isinstance(idx, int) and 0 <= idx < len(candidates) and idx not in seen:
+            seen.add(idx)
+            r = candidates[idx]
+            score = item.get("relevance_score")
+            if score is not None:
+                r["cohere_score"] = round(float(score), 4)
+            reordered.append(r)
+    if not reordered:
+        return results
+
+    # Keep any candidate Cohere omitted, then everything past the reranked window.
+    reordered.extend(c for i, c in enumerate(candidates) if i not in seen)
+    reordered.extend(results[top_n:])
+    return reordered
+
+
 def _hybrid_rank(
     results: list,
     query: str,
@@ -129,6 +226,8 @@ def _hybrid_rank(
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
     results[:] = [r for _, r in scored]
+    # Optional final cross-encoder pass — no-op unless COHERE_RERANK=1 + key set.
+    results[:] = _cohere_rerank(results, query)
     return results
 
 
