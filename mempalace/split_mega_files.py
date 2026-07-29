@@ -232,6 +232,16 @@ def split_file(filepath, output_dir, dry_run=False):
 
 
 def main():
+    # Imported here, not at module level: the docstring documents running this
+    # file directly (python3 split_mega_files.py), where a package-relative
+    # import raises. Tolerating that keeps the standalone path working.
+    try:
+        from .console import configure_stdio
+
+        configure_stdio()
+    except ImportError:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Split concatenated transcript mega-files into per-session files"
     )
