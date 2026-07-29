@@ -34,6 +34,7 @@ import argparse
 from pathlib import Path
 
 from .config import MempalaceConfig
+from .console import configure_stdio
 
 
 def cmd_init(args):
@@ -423,6 +424,8 @@ def cmd_compress(args):
 
 
 def main():
+    configure_stdio()
+
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

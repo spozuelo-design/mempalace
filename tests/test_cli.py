@@ -1,6 +1,7 @@
 """Tests for mempalace.cli — the main CLI dispatcher."""
 
 import argparse
+import io
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -271,6 +272,18 @@ def test_main_no_args_prints_help(capsys):
         main()
     out = capsys.readouterr().out
     assert "MemPalace" in out
+
+
+def test_main_help_on_legacy_codepage_stdout(monkeypatch):
+    """Windows stdio defaults to cp1252 off-console; the help text has an em dash."""
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    with patch("sys.argv", ["mempalace"]):
+        main()  # UnicodeEncodeError before the fix
+    stdout.flush()
+
+    assert "MemPalace — Give your AI a memory" in stdout.buffer.getvalue().decode("utf-8")
 
 
 def test_main_status_dispatches():

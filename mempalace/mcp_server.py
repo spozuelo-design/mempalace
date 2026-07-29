@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import MempalaceConfig, sanitize_name, sanitize_content
+from .console import configure_stdio
 from .version import __version__
 from .backends.chroma import ChromaBackend, ChromaCollection
 from .query_sanitizer import sanitize_query
@@ -1642,6 +1643,9 @@ def handle_request(request):
 
 
 def main():
+    # JSON-RPC is UTF-8 by contract; a cp1252 stdio pair on Windows turns any
+    # non-ASCII payload into a dead server rather than a visible error.
+    configure_stdio()
     logger.info("MemPalace MCP Server starting...")
     while True:
         try:
