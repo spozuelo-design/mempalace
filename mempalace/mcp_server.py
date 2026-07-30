@@ -401,8 +401,11 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    scope: str = "curated",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
+    if scope not in ("curated", "all"):
+        return {"error": f"scope must be 'curated' or 'all', got {scope!r}"}
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
@@ -421,6 +424,7 @@ def tool_search(
         room=room,
         n_results=limit,
         max_distance=dist,
+        scope=scope,
     )
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
@@ -626,6 +630,11 @@ def tool_add_drawer(
             ],
         )
         _metadata_cache = None
+        # Mirror into the curated collection — that's what search reads by
+        # default, so a drawer that only lands in the archive is invisible.
+        from .curated import mirror_upsert
+
+        mirror_upsert(_config.palace_path, [drawer_id])
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
     except Exception as e:
@@ -657,6 +666,9 @@ def tool_delete_drawer(drawer_id: str):
     try:
         col.delete(ids=[drawer_id])
         _metadata_cache = None
+        from .curated import mirror_delete
+
+        mirror_delete(_config.palace_path, [drawer_id])
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
@@ -793,6 +805,14 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         col.update(**update_kwargs)
 
         _metadata_cache = None
+        # Re-mirror: an edit can also flip a drawer's history status (a wing
+        # change), so mirror_upsert re-evaluates and mirror_delete cleans up.
+        from .curated import is_history, mirror_delete, mirror_upsert
+
+        if is_history(new_meta):
+            mirror_delete(_config.palace_path, [drawer_id])
+        else:
+            mirror_upsert(_config.palace_path, [drawer_id])
 
         logger.info(f"Updated drawer: {drawer_id}")
         return {
@@ -1330,8 +1350,19 @@ TOOLS = {
                     "minimum": 1,
                     "maximum": 100,
                 },
-                "wing": {"type": "string", "description": "Filter by wing (optional)"},
-                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "wing": {
+                    "type": "string",
+                    "description": "Filter by wing (optional). WARNING: ChromaDB post-filters, so a narrow wing/room filter can return far fewer results than requested, or none. Prefer an unfiltered query.",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Filter by room (optional). Same caveat as 'wing'.",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["curated", "all"],
+                    "description": "'curated' (default) searches curated knowledge — notes, docs, code, reports. 'all' also searches raw session transcripts, which are ~80% of the palace and drown everything else; use it only when looking for what was said in a past conversation.",
+                },
                 "max_distance": {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",

@@ -23,7 +23,7 @@ from collections import defaultdict
 
 from .config import MempalaceConfig
 from .palace import get_collection as _get_collection
-from .searcher import build_where_filter
+from .searcher import build_where_filter, resolve_drawers_collection
 
 
 # ---------------------------------------------------------------------------
@@ -242,18 +242,26 @@ class Layer2:
 
 class Layer3:
     """
-    Unlimited depth. Semantic search against the full palace.
-    Reuses searcher.py logic against mempalace_drawers.
+    Unlimited depth. Semantic search against the palace.
+    Reuses searcher.py logic; searches the curated collection when it exists
+    (see searcher.resolve_drawers_collection), the full archive otherwise.
     """
 
     def __init__(self, palace_path: str = None):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
 
-    def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
+    def search(
+        self,
+        query: str,
+        wing: str = None,
+        room: str = None,
+        n_results: int = 5,
+        scope: str = "curated",
+    ) -> str:
         """Semantic search, returns compact result text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col, _ = resolve_drawers_collection(self.palace_path, scope)
         except Exception:
             return "No palace found."
 

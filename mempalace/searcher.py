@@ -22,6 +22,52 @@ _CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
 
 logger = logging.getLogger("mempalace_mcp")
 
+# ---------------------------------------------------------------------------
+# Which collection do we search?
+#
+# `mempalace_drawers` holds EVERYTHING, including raw session transcripts. On a
+# palace where transcripts dominate (measured here: 111k of 138k drawers, 80%),
+# they win every query — they're semantically close to any technical question,
+# so curated notes never surface. Filtering them out with a `where` clause does
+# NOT work: ChromaDB 1.5.9 post-filters (it finds the HNSW neighbours first,
+# then intersects with the metadata filter), so a filtered query returns
+# whatever survives — often nothing. Measured: `wing=claude`, 5.580 live
+# drawers, returned 0 hits.
+#
+# So the split is physical: `mempalace_curated` is a second collection holding
+# only the non-transcript drawers. Searching it is unfiltered, so HNSW recall
+# is intact. `mempalace_drawers` stays untouched as the full archive and is
+# still reachable with scope="all".
+#
+# Fallback-safe: if the curated collection doesn't exist (fresh palace, another
+# machine), everything degrades to the full collection exactly as before.
+CURATED_COLLECTION = "mempalace_curated"
+ARCHIVE_COLLECTION = "mempalace_drawers"
+
+# Candidates fetched from the vector index before any re-ranking, regardless
+# of how few results the caller asked for. Feeds the closet-boost stage.
+MIN_RERANK_CANDIDATES = 30
+# How many of those the BM25 re-rank is allowed to reorder. See search_memories().
+RERANK_POOL = 10
+
+
+def resolve_drawers_collection(palace_path: str, scope: str = "curated"):
+    """Return (collection, name_used) for the requested search scope.
+
+    scope="curated"  prefer the curated collection, fall back to the archive
+    scope="all"      the full archive, transcripts included
+    """
+    if scope != "all":
+        try:
+            col = get_collection(palace_path, collection_name=CURATED_COLLECTION, create=False)
+            if col.count() > 0:
+                return col, CURATED_COLLECTION
+        except Exception:
+            pass
+    return get_collection(palace_path, collection_name=ARCHIVE_COLLECTION, create=False), (
+        ARCHIVE_COLLECTION
+    )
+
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
@@ -222,63 +268,65 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     }
 
 
-def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
+def search(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    scope: str = "curated",
+):
     """
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
+
+    scope="curated" (default) searches curated knowledge only; scope="all"
+    includes raw session transcripts. See resolve_drawers_collection().
+
+    Delegates to search_memories() so the CLI and the MCP server rank
+    identically. They used to differ — this printed raw vector order while the
+    MCP applied closet boosting and BM25 — which meant the CLI quietly returned
+    worse results than the same query through Claude. Measured on the
+    mempalace_bench suite: raw vector MRR 0.51 against 0.55 for the full path.
     """
-    try:
-        col = get_collection(palace_path, create=False)
-    except Exception:
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        raise SearchError(f"No palace found at {palace_path}")
+    result = search_memories(
+        query,
+        palace_path,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        scope=scope,
+    )
 
-    where = build_where_filter(wing, room)
+    if "error" in result:
+        if result["error"] == "No palace found":
+            print(f"\n  No palace found at {palace_path}")
+            print("  Run: mempalace init <dir> then mempalace mine <dir>")
+        else:
+            print(f"\n  {result['error']}")
+        raise SearchError(result["error"])
 
-    try:
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-
-        results = col.query(**kwargs)
-
-    except Exception as e:
-        print(f"\n  Search error: {e}")
-        raise SearchError(f"Search error: {e}") from e
-
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    dists = results["distances"][0]
-
-    if not docs:
+    hits = result["results"]
+    if not hits:
         print(f'\n  No results found for: "{query}"')
         return
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
+    print(f"  Scope: {result['scope']}")
     if wing:
         print(f"  Wing: {wing}")
     if room:
         print(f"  Room: {room}")
     print(f"{'=' * 60}\n")
 
-    for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
-        similarity = round(max(0.0, 1 - dist), 3)
-        source = Path(meta.get("source_file", "?")).name
-        wing_name = meta.get("wing", "?")
-        room_name = meta.get("room", "?")
-
-        print(f"  [{i}] {wing_name} / {room_name}")
-        print(f"      Source: {source}")
-        print(f"      Match:  {similarity}")
+    for i, hit in enumerate(hits, 1):
+        print(f"  [{i}] {hit['wing']} / {hit['room']}")
+        print(f"      Source: {hit['source_file']}")
+        print(f"      Match:  {hit['similarity']}")
         print()
         # Print the verbatim text, indented
-        for line in doc.strip().split("\n"):
+        for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
         print(f"  {'─' * 56}")
@@ -293,6 +341,7 @@ def search_memories(
     room: str = None,
     n_results: int = 5,
     max_distance: float = 0.0,
+    scope: str = "curated",
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -308,9 +357,15 @@ def search_memories(
             cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
             Results with distance > this value are filtered out. A value of
             0.0 disables filtering. Typical useful range: 0.3–1.0.
+        scope: "curated" (default) searches curated knowledge only; "all"
+            includes raw session transcripts. See resolve_drawers_collection().
+
+    Note on wing/room filters: ChromaDB post-filters, so a narrow filter can
+    return far fewer results than requested — or none. Prefer plain queries
+    against the curated scope over filtering.
     """
     try:
-        drawers_col = get_collection(palace_path, create=False)
+        drawers_col, col_name = resolve_drawers_collection(palace_path, scope)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -327,10 +382,18 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
+    # Over-fetch before re-ranking. The multiplier alone is too thin at the
+    # small n_results callers actually use: n_results=2 gave the BM25 and
+    # closet stages only 6 candidates to work with, so they could not fix a bad
+    # vector order. The floor keeps the re-rank pool useful regardless of how
+    # many results the caller asked for. Measured on mempalace_bench at k=5:
+    # MRR 0.455 -> 0.526, top-1 4/13 -> 5/13, k=10 unchanged. Costs nothing —
+    # still a single HNSW query.
+    overfetch = max(n_results * 3, MIN_RERANK_CANDIDATES)
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            "n_results": overfetch,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -415,7 +478,27 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+
+    # BM25 hybrid re-rank over a BOUNDED pool, then truncate.
+    #
+    # The size matters in both directions and was measured, not guessed. Too
+    # small (the old behaviour: re-rank exactly the n_results kept) and BM25
+    # cannot promote the right drawer from rank 8 — at k=3 it only ever
+    # shuffled the three it was handed. Too large (the whole 30-candidate
+    # over-fetch) and BM25 drags up lexical near-misses the vector order had
+    # correctly pushed down. mempalace_bench, MRR (top-3 hits out of 13):
+    #
+    #     pool         k=3          k=5          k=10
+    #     n_results    0.462 (7)    0.526 (9)    0.552 (9)
+    #     all 30       0.513 (9)    0.528 (9)    0.528 (9)
+    #     max(n,10)    0.538 (10)   0.538 (10)   0.549 (10)
+    #
+    # The bounded pool wins at every k the callers actually use and is the only
+    # one whose behaviour is stable across k. It gives up 0.003 MRR at k=10
+    # against re-ranking n_results, and buys a top-3 hit for it.
+    pool = scored[: max(n_results, RERANK_POOL)]
+    _hybrid_rank(pool, query)
+    hits = pool[:n_results]
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
     # multiple drawers, return the keyword-best chunk + its immediate
@@ -472,8 +555,6 @@ def search_memories(
         h["drawer_index"] = best_idx
         h["total_drawers"] = len(ordered_docs)
 
-    # BM25 hybrid re-rank within the final candidate set.
-    hits = _hybrid_rank(hits, query)
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
@@ -482,6 +563,7 @@ def search_memories(
     return {
         "query": query,
         "filters": {"wing": wing, "room": room},
+        "scope": col_name,
         "total_before_filter": len(drawer_results["documents"][0]),
         "results": hits,
     }

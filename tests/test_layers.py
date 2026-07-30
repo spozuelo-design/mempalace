@@ -381,7 +381,10 @@ def test_layer3_search_with_results():
     )
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch(
+            "mempalace.layers.resolve_drawers_collection",
+            return_value=(mock_col, "mempalace_curated"),
+        ),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -397,7 +400,10 @@ def test_layer3_search_no_results():
     mock_col.query.return_value = _mock_query_results([], [], [])
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch(
+            "mempalace.layers.resolve_drawers_collection",
+            return_value=(mock_col, "mempalace_curated"),
+        ),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -415,7 +421,10 @@ def test_layer3_search_with_wing_filter():
     )
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch(
+            "mempalace.layers.resolve_drawers_collection",
+            return_value=(mock_col, "mempalace_curated"),
+        ),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -434,7 +443,10 @@ def test_layer3_search_with_room_filter():
     )
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch(
+            "mempalace.layers.resolve_drawers_collection",
+            return_value=(mock_col, "mempalace_curated"),
+        ),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -453,7 +465,10 @@ def test_layer3_search_with_wing_and_room():
     )
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch(
+            "mempalace.layers.resolve_drawers_collection",
+            return_value=(mock_col, "mempalace_curated"),
+        ),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -468,7 +483,10 @@ def test_layer3_search_error():
     mock_col.query.side_effect = RuntimeError("search failed")
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch(
+            "mempalace.layers.resolve_drawers_collection",
+            return_value=(mock_col, "mempalace_curated"),
+        ),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -486,7 +504,10 @@ def test_layer3_search_truncates_long_docs():
     )
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch(
+            "mempalace.layers.resolve_drawers_collection",
+            return_value=(mock_col, "mempalace_curated"),
+        ),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")

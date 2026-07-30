@@ -14,7 +14,10 @@ class BaseCollection(ABC):
         documents: List[str],
         ids: List[str],
         metadatas: Optional[List[Dict[str, Any]]] = None,
+        embeddings: Optional[List[List[float]]] = None,
     ) -> None:
+        """Add records. Pass ``embeddings`` to reuse vectors already computed
+        elsewhere instead of paying to embed the documents again."""
         raise NotImplementedError
 
     @abstractmethod
@@ -24,6 +27,7 @@ class BaseCollection(ABC):
         documents: List[str],
         ids: List[str],
         metadatas: Optional[List[Dict[str, Any]]] = None,
+        embeddings: Optional[List[List[float]]] = None,
     ) -> None:
         raise NotImplementedError
 

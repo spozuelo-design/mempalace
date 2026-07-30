@@ -1,0 +1,227 @@
+"""
+curated.py — the curated drawer collection.
+
+`mempalace_drawers` holds everything that was ever mined, raw chat transcripts
+included. On a palace where transcripts dominate they win every query: they are
+semantically close to any technical question, so curated notes never surface.
+
+Excluding them with a ``where`` clause does not work. ChromaDB (1.5.x) resolves
+a filtered vector query by finding the HNSW neighbours *first* and intersecting
+with the metadata filter afterwards. When 80% of the index is transcripts, the
+neighbours are transcripts, and the intersection is small or empty — a filtered
+query returns far fewer hits than asked for, sometimes zero, with no error.
+
+So the split is physical: ``mempalace_curated`` is a second collection holding
+only the non-transcript drawers. Queries against it are unfiltered, so HNSW
+recall is intact. Nothing is deleted — ``mempalace_drawers`` remains the full
+archive and stays reachable via scope="all".
+
+Vectors are COPIED, never recomputed: ``get(include=["embeddings"])`` on the
+archive and ``add(embeddings=...)`` on the curated collection. Rebuilding 138k
+drawers this way takes ~2 minutes, against ~3 hours for a `repair` that
+re-embeds.
+"""
+
+import logging
+
+from .palace import get_collection
+
+logger = logging.getLogger("mempalace")
+
+CURATED_COLLECTION = "mempalace_curated"
+ARCHIVE_COLLECTION = "mempalace_drawers"
+
+# Wings that hold raw session transcripts rather than curated knowledge.
+HISTORY_WINGS = frozenset({"claude_history", "claude-history"})
+
+# Path fragments that mark a transcript dump even when it was filed under
+# another wing (e.g. convos_001.json living in wing "personal").
+HISTORY_PATH_MARKERS = (
+    "convos_",
+    "claude_export",
+    "sesiones-cowork",
+    "/claude-history/",
+    "/claude_history/",
+)
+
+# Payload batches stay small — each row carries a 384-float vector.
+_BATCH = 1000
+# Id-only scans carry no payload, so page much bigger: the sync diff over 138k
+# drawers goes from ~30s to a couple of seconds.
+_ID_BATCH = 20000
+
+
+def is_history(meta: dict) -> bool:
+    """True if this drawer is raw conversation transcript, not curated knowledge."""
+    if not meta:
+        return False
+    if meta.get("wing") in HISTORY_WINGS:
+        return True
+    src = (meta.get("source_file") or "").replace("\\", "/").lower()
+    return any(marker in src for marker in HISTORY_PATH_MARKERS)
+
+
+def _iter_archive(archive, include, batch=_BATCH):
+    """Page through the archive collection yielding raw get() payloads."""
+    offset, total = 0, archive.count()
+    while offset < total:
+        page = archive.get(limit=batch, offset=offset, include=include)
+        ids = page.get("ids") or []
+        if not ids:
+            return
+        yield page
+        offset += len(ids)
+
+
+def rebuild(palace_path: str, ef_search: int = 400, progress=None) -> dict:
+    """Drop and rebuild the curated collection from the archive.
+
+    Returns {"kept": n, "skipped": n}.
+    """
+    from .backends.chroma import ChromaBackend
+
+    backend = ChromaBackend()
+    archive = get_collection(palace_path, collection_name=ARCHIVE_COLLECTION, create=False)
+
+    try:
+        backend.delete_collection(palace_path, CURATED_COLLECTION)
+    except Exception:
+        pass
+
+    client = backend._client(palace_path)  # noqa: SLF001 — need configuration= support
+    curated = client.create_collection(
+        CURATED_COLLECTION,
+        configuration={"hnsw": {"space": "cosine", "ef_search": ef_search}},
+    )
+
+    kept = skipped = 0
+    for page in _iter_archive(archive, ["documents", "metadatas", "embeddings"]):
+        ids, docs = page["ids"], page.get("documents") or []
+        metas, embs = page.get("metadatas") or [], page.get("embeddings")
+        b = ([], [], [], [])
+        for i, _id in enumerate(ids):
+            meta = metas[i] or {}
+            if is_history(meta):
+                skipped += 1
+                continue
+            b[0].append(_id)
+            b[1].append(docs[i])
+            b[2].append(meta)
+            b[3].append(embs[i])
+        if b[0]:
+            curated.add(ids=b[0], documents=b[1], metadatas=b[2], embeddings=b[3])
+            kept += len(b[0])
+        if progress:
+            progress(kept, skipped)
+
+    return {"kept": kept, "skipped": skipped}
+
+
+def sync(palace_path: str) -> dict:
+    """Bring the curated collection up to date with the archive, incrementally.
+
+    Adds drawers mined since the last sync, drops drawers deleted from the
+    archive. Cheap enough to run after every mine: the diff is computed from
+    id-only scans, and only genuinely new drawers are read with their vectors.
+
+    Returns {"added": n, "removed": n, "skipped": n} — or {"error": ...} if the
+    curated collection does not exist yet (run rebuild() first).
+    """
+    archive = get_collection(palace_path, collection_name=ARCHIVE_COLLECTION, create=False)
+    try:
+        curated = get_collection(palace_path, collection_name=CURATED_COLLECTION, create=False)
+    except Exception:
+        return {"error": "no curated collection — run `mempalace curate --rebuild` first"}
+
+    archive_ids, curated_ids = set(), set()
+    for page in _iter_archive(archive, [], batch=_ID_BATCH):
+        archive_ids.update(page["ids"])
+    offset, total = 0, curated.count()
+    while offset < total:
+        page = curated.get(limit=_ID_BATCH, offset=offset, include=[])
+        ids = page.get("ids") or []
+        if not ids:
+            break
+        curated_ids.update(ids)
+        offset += len(ids)
+
+    stale = list(curated_ids - archive_ids)
+    if stale:
+        for i in range(0, len(stale), _BATCH):
+            curated.delete(ids=stale[i : i + _BATCH])
+
+    missing = list(archive_ids - curated_ids)
+    added = skipped = 0
+    for i in range(0, len(missing), _BATCH):
+        chunk = missing[i : i + _BATCH]
+        page = archive.get(ids=chunk, include=["documents", "metadatas", "embeddings"])
+        ids, docs = page.get("ids") or [], page.get("documents") or []
+        metas, embs = page.get("metadatas") or [], page.get("embeddings")
+        b = ([], [], [], [])
+        for j, _id in enumerate(ids):
+            meta = metas[j] or {}
+            if is_history(meta):
+                skipped += 1
+                continue
+            b[0].append(_id)
+            b[1].append(docs[j])
+            b[2].append(meta)
+            b[3].append(embs[j])
+        if b[0]:
+            curated.add(ids=b[0], documents=b[1], metadatas=b[2], embeddings=b[3])
+            added += len(b[0])
+
+    return {"added": added, "removed": len(stale), "skipped": skipped}
+
+
+def mirror_upsert(palace_path: str, ids: list) -> None:
+    """Mirror specific archive drawers into the curated collection.
+
+    For the single-drawer write paths (MCP add/update), where a full sync would
+    be wasteful. Reads the vectors back from the archive rather than
+    recomputing, so the two collections can never disagree. Never raises: if
+    the mirror fails the drawer is still in the archive, reachable with
+    scope="all".
+    """
+    if not ids:
+        return
+    try:
+        archive = get_collection(palace_path, collection_name=ARCHIVE_COLLECTION, create=False)
+        curated = get_collection(palace_path, collection_name=CURATED_COLLECTION, create=False)
+        page = archive.get(ids=list(ids), include=["documents", "metadatas", "embeddings"])
+        got, docs = page.get("ids") or [], page.get("documents") or []
+        metas, embs = page.get("metadatas") or [], page.get("embeddings")
+        b = ([], [], [], [])
+        for i, _id in enumerate(got):
+            meta = metas[i] or {}
+            if is_history(meta):
+                continue
+            b[0].append(_id)
+            b[1].append(docs[i])
+            b[2].append(meta)
+            b[3].append(embs[i])
+        if b[0]:
+            curated.upsert(ids=b[0], documents=b[1], metadatas=b[2], embeddings=b[3])
+    except Exception:
+        logger.debug("curated mirror_upsert skipped", exc_info=True)
+
+
+def mirror_delete(palace_path: str, ids: list) -> None:
+    """Drop specific drawers from the curated collection. Never raises."""
+    if not ids:
+        return
+    try:
+        curated = get_collection(palace_path, collection_name=CURATED_COLLECTION, create=False)
+        curated.delete(ids=list(ids))
+    except Exception:
+        logger.debug("curated mirror_delete skipped", exc_info=True)
+
+
+def sync_quietly(palace_path: str) -> None:
+    """Fire-and-forget sync for the tail of a mine. Never raises."""
+    try:
+        stats = sync(palace_path)
+        if "error" not in stats and (stats["added"] or stats["removed"]):
+            logger.info("curated collection synced: +%d -%d", stats["added"], stats["removed"])
+    except Exception:
+        logger.exception("curated sync failed (search falls back to the full archive)")

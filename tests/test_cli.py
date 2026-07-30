@@ -65,7 +65,18 @@ def test_cmd_search_calls_search(mock_config_cls):
             wing="mywing",
             room="myroom",
             n_results=3,
+            scope="curated",
         )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_search_all_flag_uses_archive_scope(mock_config_cls):
+    """--all widens the search to the full archive, transcripts included."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, query="q", wing=None, room=None, results=5, all=True)
+    with patch("mempalace.searcher.search") as mock_search:
+        cmd_search(args)
+        assert mock_search.call_args.kwargs["scope"] == "all"
 
 
 @patch("mempalace.cli.MempalaceConfig")

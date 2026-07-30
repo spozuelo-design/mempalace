@@ -49,11 +49,19 @@ class ChromaCollection(BaseCollection):
     def __init__(self, collection):
         self._collection = collection
 
-    def add(self, *, documents, ids, metadatas=None):
-        self._collection.add(documents=documents, ids=ids, metadatas=metadatas)
+    def add(self, *, documents, ids, metadatas=None, embeddings=None):
+        kw = {"documents": documents, "ids": ids, "metadatas": metadatas}
+        # Only pass embeddings when supplied: omitting the key lets ChromaDB
+        # compute them, passing None explicitly does not.
+        if embeddings is not None:
+            kw["embeddings"] = embeddings
+        self._collection.add(**kw)
 
-    def upsert(self, *, documents, ids, metadatas=None):
-        self._collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
+    def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
+        kw = {"documents": documents, "ids": ids, "metadatas": metadatas}
+        if embeddings is not None:
+            kw["embeddings"] = embeddings
+        self._collection.upsert(**kw)
 
     def update(self, **kwargs):
         self._collection.update(**kwargs)

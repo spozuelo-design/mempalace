@@ -98,6 +98,49 @@ def cmd_mine(args):
             include_ignored=include_ignored,
         )
 
+    # Keep the curated collection in step. Without this a freshly mined note
+    # lands only in the archive, where transcripts drown it — the exact failure
+    # the curated split exists to fix. Cheap (id diff) and never fatal.
+    if not args.dry_run:
+        from .curated import sync
+
+        try:
+            stats = sync(palace_path)
+        except Exception as e:
+            # A failed sync must never fail the mine — the drawers are filed;
+            # they are just not in the curated collection yet.
+            print(f"\n  Curated sync failed ({e}) — run: mempalace curate")
+        else:
+            if "error" in stats:
+                print("\n  Curated collection not built yet — run: mempalace curate --rebuild")
+            elif stats["added"] or stats["removed"]:
+                print(f"\n  Curated collection: +{stats['added']} -{stats['removed']}")
+
+
+def cmd_curate(args):
+    """Build or refresh the curated (transcript-free) search collection."""
+    from .curated import rebuild, sync, CURATED_COLLECTION
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    if args.rebuild:
+        print(f"  Rebuilding {CURATED_COLLECTION} from the archive (copying vectors)...")
+
+        def progress(kept, skipped):
+            print(f"    kept={kept} skipped={skipped}", end="\r", flush=True)
+
+        stats = rebuild(palace_path, progress=progress)
+        print(
+            f"\n  Done — {stats['kept']} curated drawers, {stats['skipped']} transcripts skipped."
+        )
+        return
+
+    stats = sync(palace_path)
+    if "error" in stats:
+        print(f"  {stats['error']}")
+        sys.exit(1)
+    print(f"  Synced — added {stats['added']}, removed {stats['removed']}.")
+
 
 def cmd_search(args):
     from .searcher import search, SearchError
@@ -110,6 +153,7 @@ def cmd_search(args):
             wing=args.wing,
             room=args.room,
             n_results=args.results,
+            scope="all" if getattr(args, "all", False) else "curated",
         )
     except SearchError:
         sys.exit(1)
@@ -491,6 +535,23 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--all",
+        action="store_true",
+        help="Search the full archive, raw session transcripts included "
+        "(default: curated knowledge only)",
+    )
+
+    # curate
+    p_curate = sub.add_parser(
+        "curate",
+        help="Build/refresh the curated collection searched by default (excludes transcripts)",
+    )
+    p_curate.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Rebuild from scratch instead of syncing incrementally",
+    )
 
     # compress
     p_compress = sub.add_parser(
@@ -617,6 +678,7 @@ def main():
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
+        "curate": cmd_curate,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
