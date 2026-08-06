@@ -51,6 +51,26 @@ _BATCH = 1000
 _ID_BATCH = 20000
 
 
+# --- Data dumps -----------------------------------------------------------
+#
+# Excluding transcripts was not enough. An audit on 2026-08-06 found the curated
+# collection was 80% machine-generated data: one file,
+# dashboard-comercial/data/dashboard_data.js, held 12638 of 27687 drawers (46%),
+# while genuine notes (.md) were 10.9%. A data dump is semantically close to any
+# question about its subject, so it crowds out notes exactly the way transcripts
+# used to — the failure that motivated splitting the collection, reproduced one
+# level down.
+#
+# The tell is fan-out, not path: a document yields a handful of drawers, a dump
+# yields hundreds. Keyed on extension too, so a long hand-written .md is never
+# mistaken for a dump.
+DUMP_EXTENSIONS = frozenset(
+    {".js", ".json", ".jsonl", ".csv", ".tsv", ".html", ".htm", ".xml", ".map"}
+)
+# Drawers from a single source file above which it is machine-generated data.
+DUMP_FANOUT = 150
+
+
 def is_history(meta: dict) -> bool:
     """True if this drawer is raw conversation transcript, not curated knowledge."""
     if not meta:
@@ -59,6 +79,33 @@ def is_history(meta: dict) -> bool:
         return True
     src = (meta.get("source_file") or "").replace("\\", "/").lower()
     return any(marker in src for marker in HISTORY_PATH_MARKERS)
+
+
+def _has_dump_extension(source_file: str) -> bool:
+    name = (source_file or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return "." in name and ("." + name.rsplit(".", 1)[-1]) in DUMP_EXTENSIONS
+
+
+def dump_sources(archive, fanout: int = DUMP_FANOUT) -> set:
+    """Source files that exploded into so many drawers they must be data dumps.
+
+    One metadata-only pass over the archive. Returns a set of source_file values
+    to exclude wholesale.
+    """
+    counts = {}
+    for page in _iter_archive(archive, ["metadatas"], batch=5000):
+        for meta in page.get("metadatas") or []:
+            src = (meta or {}).get("source_file")
+            if src and _has_dump_extension(src):
+                counts[src] = counts.get(src, 0) + 1
+    return {src for src, n in counts.items() if n >= fanout}
+
+
+def is_excluded(meta: dict, dumps: set) -> bool:
+    """True if this drawer stays out of the curated collection."""
+    if is_history(meta):
+        return True
+    return bool(dumps) and (meta or {}).get("source_file") in dumps
 
 
 def _iter_archive(archive, include, batch=_BATCH):
@@ -83,6 +130,10 @@ def rebuild(palace_path: str, ef_search: int = 400, progress=None) -> dict:
     backend = ChromaBackend()
     archive = get_collection(palace_path, collection_name=ARCHIVE_COLLECTION, create=False)
 
+    # Cheap metadata pass first: which source files are data dumps.
+    dumps = dump_sources(archive)
+    logger.info("curated rebuild: excluding %d data-dump source files", len(dumps))
+
     try:
         backend.delete_collection(palace_path, CURATED_COLLECTION)
     except Exception:
@@ -101,7 +152,7 @@ def rebuild(palace_path: str, ef_search: int = 400, progress=None) -> dict:
         b = ([], [], [], [])
         for i, _id in enumerate(ids):
             meta = metas[i] or {}
-            if is_history(meta):
+            if is_excluded(meta, dumps):
                 skipped += 1
                 continue
             b[0].append(_id)
@@ -151,6 +202,23 @@ def sync(palace_path: str) -> dict:
             curated.delete(ids=stale[i : i + _BATCH])
 
     missing = list(archive_ids - curated_ids)
+
+    # Which of the new drawers come from data dumps? A full dump_sources() pass
+    # would cost more than the whole sync, so resolve only the source files these
+    # drawers actually touch — a mine usually touches a handful.
+    candidates = set()
+    for i in range(0, len(missing), _BATCH):
+        page = archive.get(ids=missing[i : i + _BATCH], include=["metadatas"])
+        for meta in page.get("metadatas") or []:
+            src = (meta or {}).get("source_file")
+            if src and _has_dump_extension(src):
+                candidates.add(src)
+    dumps = set()
+    for src in candidates:
+        hits = archive.get(where={"source_file": src}, include=[]).get("ids") or []
+        if len(hits) >= DUMP_FANOUT:
+            dumps.add(src)
+
     added = skipped = 0
     for i in range(0, len(missing), _BATCH):
         chunk = missing[i : i + _BATCH]
@@ -160,7 +228,7 @@ def sync(palace_path: str) -> dict:
         b = ([], [], [], [])
         for j, _id in enumerate(ids):
             meta = metas[j] or {}
-            if is_history(meta):
+            if is_excluded(meta, dumps):
                 skipped += 1
                 continue
             b[0].append(_id)
@@ -194,6 +262,9 @@ def mirror_upsert(palace_path: str, ids: list) -> None:
         b = ([], [], [], [])
         for i, _id in enumerate(got):
             meta = metas[i] or {}
+            # No dump check here on purpose: this path carries hand-written
+            # drawers one at a time, and fan-out cannot be judged from one id
+            # without a query on a hot path. The next sync/rebuild settles it.
             if is_history(meta):
                 continue
             b[0].append(_id)
