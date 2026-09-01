@@ -129,10 +129,24 @@ def cmd_curate(args):
         def progress(kept, skipped):
             print(f"    kept={kept} skipped={skipped}", end="\r", flush=True)
 
-        stats = rebuild(palace_path, progress=progress)
+        try:
+            stats = rebuild(palace_path, progress=progress)
+        except RuntimeError as exc:
+            # El lock. Un guardarrail tiene que leerse limpio: un traceback de
+            # veinte lineas se lee por encima, y lo que hay que leer es la
+            # instruccion de que NO se lance otro rebuild encima.
+            print(f"\n  {exc}")
+            raise SystemExit(1)
         print(
             f"\n  Done — {stats['kept']} curated drawers, {stats['skipped']} transcripts skipped."
         )
+        if stats.get("unreadable"):
+            # Que un rebuild termine incompleto es aceptable; que no lo diga, no.
+            print(
+                f"  ATENCION: {stats['unreadable']} registro(s) del archivo no se "
+                "pudieron leer y quedaron fuera. Vuelven en la siguiente "
+                "reconstruccion, cuando el segmento de vectores se ponga al dia."
+            )
         return
 
     stats = sync(palace_path)

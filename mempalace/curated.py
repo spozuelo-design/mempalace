@@ -23,6 +23,11 @@ re-embeds.
 """
 
 import logging
+import os
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
 
 from .palace import get_collection
 
@@ -108,64 +113,190 @@ def is_excluded(meta: dict, dumps: set) -> bool:
     return bool(dumps) and (meta or {}).get("source_file") in dumps
 
 
-def _iter_archive(archive, include, batch=_BATCH):
-    """Page through the archive collection yielding raw get() payloads."""
+def _read_records(archive, offset, n, include, unreadable):
+    """Read *n* records one by one, skipping the ones that cannot be read.
+
+    A page can fail for reasons that have nothing to do with the drawer being
+    lost: the vector segment may not have caught up with the write log yet, or
+    an id may carry a tombstone from an earlier delete. Aborting the whole
+    rebuild for that leaves the curated collection truncated, which is worse
+    than finishing without those few records.
+
+    Always reports *n* positions consumed, so paging by offset stays aligned
+    even when some records drop out.
+    """
+    page = {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+    for k in range(offset, offset + n):
+        try:
+            one = archive.get(limit=1, offset=k, include=include)
+        except Exception:
+            unreadable.append(k)
+            continue
+        for key in page:
+            got = one.get(key)
+            if got is not None and len(got):
+                page[key].append(got[0])
+    return page, n
+
+
+def _iter_archive(archive, include, batch=_BATCH, unreadable=None):
+    """Page through the archive collection yielding raw get() payloads.
+
+    Tolerant by design: if a page cannot be read, it drops to one record at a
+    time and skips only what is genuinely unreadable. The offsets of what was
+    skipped land in *unreadable* so the caller can name them instead of
+    swallowing the loss.
+    """
+    if unreadable is None:
+        unreadable = []
     offset, total = 0, archive.count()
     while offset < total:
-        page = archive.get(limit=batch, offset=offset, include=include)
-        ids = page.get("ids") or []
-        if not ids:
-            return
-        yield page
-        offset += len(ids)
+        n = min(batch, total - offset)
+        try:
+            page = archive.get(limit=n, offset=offset, include=include)
+            consumed = len(page.get("ids") or [])
+            if consumed == 0:
+                return
+        except Exception as exc:
+            logger.warning(
+                "curated: unreadable page at offset %d (%s) - falling back to one record at a time",
+                offset,
+                exc,
+            )
+            page, consumed = _read_records(archive, offset, n, include, unreadable)
+        if page.get("ids"):
+            yield page
+        offset += consumed
+
+
+@contextmanager
+def _rebuild_lock(palace_path: str, stale_after_s: int = 1800):
+    """One rebuild at a time.
+
+    Two rebuilds at once corrupt the curated collection: measured 2026-08-31,
+    one deleted and recreated it while the other was still writing and the
+    result was 9.080 drawers instead of ~11.850. There was no lock. Now there is.
+    """
+    lock = Path(palace_path) / ".curate-rebuild.lock"
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            quien = lock.read_text(encoding="utf-8").strip()
+            edad = time.time() - lock.stat().st_mtime
+        except Exception:
+            quien, edad = "(ilegible)", 0.0
+        if edad < stale_after_s:
+            raise RuntimeError(
+                "another rebuild holds the lock ({}), {:.0f}s old. Wait for it: "
+                "it rebuilds from the archive, so its result also picks up what "
+                "you just mined. Do not kill it and do not start another. "
+                "If that process is gone -- a rebuild that segfaults leaves the "
+                "lock behind, because a crash does not run the cleanup -- delete "
+                "{} and try again; after {:.0f}s it is taken as stale on its "
+                "own.".format(quien, edad, lock, stale_after_s)
+            )
+        logger.warning("curated: taking a stale rebuild lock (%s, %.0fs old)", quien, edad)
+        lock.unlink(missing_ok=True)
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        os.write(
+            fd,
+            "pid={} started={}".format(
+                os.getpid(), datetime.now().isoformat(timespec="seconds")
+            ).encode(),
+        )
+        os.close(fd)
+        yield
+    finally:
+        try:
+            lock.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("curated: could not remove %s", lock)
 
 
 def rebuild(palace_path: str, ef_search: int = 400, progress=None) -> dict:
-    """Drop and rebuild the curated collection from the archive.
+    """Rebuild the curated collection from the archive, without destroying it first.
 
-    Returns {"kept": n, "skipped": n}.
+    Builds into a temporary collection and only swaps names once it is complete.
+    An interrupted rebuild therefore leaves the previous curated collection
+    intact: worse than the ideal one, but whole and known. The old behaviour --
+    delete first, refill after -- left `search` degraded at whatever point it
+    died, measured 2026-09-01 at 10.708 drawers instead of ~11.950.
+
+    Returns {"kept": n, "skipped": n, "unreadable": n}.
     """
     from .backends.chroma import ChromaBackend
 
     backend = ChromaBackend()
-    archive = get_collection(palace_path, collection_name=ARCHIVE_COLLECTION, create=False)
 
-    # Cheap metadata pass first: which source files are data dumps.
-    dumps = dump_sources(archive)
-    logger.info("curated rebuild: excluding %d data-dump source files", len(dumps))
+    # El lock va PRIMERO, antes de tocar el archivo. Tenerlo despues de
+    # dump_sources() era un fallo: el segundo proceso escaneaba los ~141k
+    # metadatos en paralelo con el primero y la maquina (8 GB soldados) moria
+    # con un segfault antes de llegar a mirar el lock. Medido el 2026-09-01: dos
+    # rebuilds a la vez, el segundo con rc=139 en vez del aviso. Un guardarrail
+    # que se toma tarde no guarda nada.
+    with _rebuild_lock(palace_path):
+        archive = get_collection(palace_path, collection_name=ARCHIVE_COLLECTION, create=False)
 
-    try:
-        backend.delete_collection(palace_path, CURATED_COLLECTION)
-    except Exception:
-        pass
+        # Cheap metadata pass first: which source files are data dumps.
+        dumps = dump_sources(archive)
+        logger.info("curated rebuild: excluding %d data-dump source files", len(dumps))
 
-    client = backend._client(palace_path)  # noqa: SLF001 — need configuration= support
-    curated = client.create_collection(
-        CURATED_COLLECTION,
-        configuration={"hnsw": {"space": "cosine", "ef_search": ef_search}},
-    )
+        client = backend._client(palace_path)  # noqa: SLF001 — need configuration= support
+        tmp_name = CURATED_COLLECTION + "_rebuilding"
+        # A temp left behind by a crashed run must not poison this one.
+        try:
+            backend.delete_collection(palace_path, tmp_name)
+        except Exception:
+            pass
+        curated = client.create_collection(
+            tmp_name,
+            configuration={"hnsw": {"space": "cosine", "ef_search": ef_search}},
+        )
 
-    kept = skipped = 0
-    for page in _iter_archive(archive, ["documents", "metadatas", "embeddings"]):
-        ids, docs = page["ids"], page.get("documents") or []
-        metas, embs = page.get("metadatas") or [], page.get("embeddings")
-        b = ([], [], [], [])
-        for i, _id in enumerate(ids):
-            meta = metas[i] or {}
-            if is_excluded(meta, dumps):
-                skipped += 1
-                continue
-            b[0].append(_id)
-            b[1].append(docs[i])
-            b[2].append(meta)
-            b[3].append(embs[i])
-        if b[0]:
-            curated.add(ids=b[0], documents=b[1], metadatas=b[2], embeddings=b[3])
-            kept += len(b[0])
-        if progress:
-            progress(kept, skipped)
+        unreadable = []
+        kept = skipped = 0
+        for page in _iter_archive(
+            archive, ["documents", "metadatas", "embeddings"], unreadable=unreadable
+        ):
+            ids, docs = page["ids"], page.get("documents") or []
+            metas, embs = page.get("metadatas") or [], page.get("embeddings")
+            b = ([], [], [], [])
+            for i, _id in enumerate(ids):
+                meta = metas[i] or {}
+                if is_excluded(meta, dumps):
+                    skipped += 1
+                    continue
+                b[0].append(_id)
+                b[1].append(docs[i])
+                b[2].append(meta)
+                b[3].append(embs[i])
+            if b[0]:
+                curated.add(ids=b[0], documents=b[1], metadatas=b[2], embeddings=b[3])
+                kept += len(b[0])
+            if progress:
+                progress(kept, skipped)
 
-    return {"kept": kept, "skipped": skipped}
+        # Swap only now: the window without a curated collection is milliseconds,
+        # instead of the whole rebuild.
+        try:
+            backend.delete_collection(palace_path, CURATED_COLLECTION)
+        except Exception:
+            pass
+        curated.modify(name=CURATED_COLLECTION)
+
+    if unreadable:
+        logger.warning(
+            "curated rebuild: %d archive records could not be read and were left "
+            "out (offsets %s%s). They come back on the next rebuild once the "
+            "vector segment catches up.",
+            len(unreadable),
+            unreadable[:10],
+            " ..." if len(unreadable) > 10 else "",
+        )
+
+    return {"kept": kept, "skipped": skipped, "unreadable": len(unreadable)}
 
 
 def sync(palace_path: str) -> dict:
