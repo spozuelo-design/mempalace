@@ -45,7 +45,6 @@ READABLE_EXTENSIONS = {
     ".rs",
     ".rb",
     ".sh",
-    ".csv",
     ".sql",
     ".toml",
 }
@@ -58,6 +57,35 @@ SKIP_FILENAMES = {
     ".gitignore",
     "package-lock.json",
 }
+
+# Datos tabulares y volcados de aplicación. No se ingieren: una fila de extracto
+# bancario no tiene contenido semántico que la distinga de otra, así que el
+# embedding las hace a todas igual de "parecidas" a cualquier consulta y acaban
+# ocupando el top con puntuaciones de ~0,03. Ruido que desplaza señal.
+#
+# Estos datos ya tienen su vía propia — los extratos, el pipeline de
+# `Auditor Financeiro/` — que es donde hay que consultarlos.
+#
+# `.csv` sale de READABLE_EXTENSIONS por el mismo motivo. En ambos casos, un
+# --include-ignored explícito sobre el fichero concreto sigue funcionando: esto
+# cambia el comportamiento por defecto, no prohíbe nada.
+SKIP_DATA_PATTERNS = (
+    "*_data.js",
+    "*-data.js",
+    "dashboard_data.*",
+    "conversations.json",
+    "memories.json",
+    "projects.json",
+    "users.json",
+    "chat_history.json",
+)
+
+
+def is_data_dump(filename: str) -> bool:
+    """¿Es este fichero un volcado de datos y no un documento?"""
+    lowered = filename.lower()
+    return any(fnmatch.fnmatch(lowered, pat) for pat in SKIP_DATA_PATTERNS)
+
 
 CHUNK_SIZE = 800  # chars per drawer
 CHUNK_OVERLAP = 100  # overlap between chunks
@@ -205,7 +233,14 @@ def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
 
 def should_skip_dir(dirname: str) -> bool:
     """Skip known generated/cache directories before gitignore matching."""
-    return dirname in SKIP_DIRS or dirname.endswith(".egg-info")
+    if dirname in SKIP_DIRS or dirname.endswith(".egg-info"):
+        return True
+    # Configuración de Obsidian: en el palacio del Mac había 5 de estos JSON
+    # ingeridos como drawers. Cero valor de recuperación.
+    if dirname == ".obsidian":
+        return True
+    # Lotes de export del tipo data-<uuid>-<ts>-<hash>-batch-0000/
+    return fnmatch.fnmatch(dirname.lower(), "data-*-batch-*")
 
 
 def normalize_include_paths(include_ignored: list) -> set:
@@ -700,6 +735,8 @@ def scan_project(
             exact_force_include = is_exact_force_include(filepath, project_path, include_paths)
 
             if not force_include and filename in SKIP_FILENAMES:
+                continue
+            if not exact_force_include and is_data_dump(filename):
                 continue
             if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
                 continue

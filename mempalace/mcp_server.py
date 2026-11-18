@@ -906,6 +906,48 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
+# El wing del diario sale de `agent_name`, no de configuración. Cada cliente
+# pasaba el suyo — "claude", "claude-code", "claudecode", "claude-cowork" — y el
+# diario acababa partido en wings que sólo se leían a sí mismos. Toda variante
+# de "claude" colapsa aquí en uno solo.
+DIARY_WING_CANONICO = "wing_claude"
+
+# Wings heredados de antes de la normalización: se LEEN, no se escriben. Cuando
+# migrate_diary_wing.py los vacíe, esta tupla puede desaparecer.
+_DIARY_WINGS_HEREDADOS = (
+    "wing_claude-code",
+    "wing_claude_code",
+    "wing_claudecode",
+    "wing_claude-cowork",
+    "wing_claude_cowork",
+    "wing_claude-desktop",
+)
+
+
+def _canonical_diary_wing(agent_name: str) -> str:
+    """Wing del diario para un agente. Toda variante de 'claude' cae en el mismo.
+
+    Se compara sobre el nombre sin separadores, así que "claude-code",
+    "claude_code", "claude code" y "claudecode" son el mismo agente. Un agente
+    que no sea claude (p. ej. "auditor_financeiro_pessoal") conserva su wing.
+    """
+    plano = agent_name.lower().replace(" ", "").replace("-", "").replace("_", "")
+    if plano.startswith("claude"):
+        return DIARY_WING_CANONICO
+    return f"wing_{agent_name.lower().replace(' ', '_')}"
+
+
+def _diary_wings_a_leer(wing: str) -> list:
+    """Wings que consulta la lectura. Incluye los heredados mientras no se migren.
+
+    Esto es lo que permite aplicar el parche antes de mover los datos: la
+    lectura sigue encontrando las entradas viejas en su wing original.
+    """
+    if wing != DIARY_WING_CANONICO:
+        return [wing]
+    return [wing, *_DIARY_WINGS_HEREDADOS]
+
+
 def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
     """
     Write a diary entry for this agent. Each agent gets its own wing
@@ -920,7 +962,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    wing = _canonical_diary_wing(agent_name)
     room = "diary"
     col = _get_collection(create=True)
     if not col:
@@ -985,14 +1027,15 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    wing = _canonical_diary_wing(agent_name)
+    wings = _diary_wings_a_leer(wing)
     col = _get_collection()
     if not col:
         return _no_palace()
 
     try:
         results = col.get(
-            where={"$and": [{"wing": wing}, {"room": "diary"}]},
+            where={"$and": [{"wing": {"$in": wings}}, {"room": "diary"}]},
             include=["documents", "metadatas"],
             limit=10000,
         )
