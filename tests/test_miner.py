@@ -88,12 +88,18 @@ def test_scan_project_allows_nested_gitignore_override():
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "*.csv\n")
-        write_file(project_root / "subrepo" / ".gitignore", "!keep.csv\n")
-        write_file(project_root / "drop.csv", "a,b,c\n" * 20)
-        write_file(project_root / "subrepo" / "keep.csv", "a,b,c\n" * 20)
+        # NB: the fixture is .md, not .csv. `.csv` left READABLE_EXTENSIONS with
+        # the exclude-tabular-data change (2026-08-20), so a .csv fixture stops
+        # asserting anything about gitignore — it fails on the extension filter
+        # before the gitignore logic is ever reached. What is under test here is
+        # the nested-gitignore override, so the file has to be one the scanner
+        # actually reads.
+        write_file(project_root / ".gitignore", "*.md\n")
+        write_file(project_root / "subrepo" / ".gitignore", "!keep.md\n")
+        write_file(project_root / "drop.md", "# drop\n" * 20)
+        write_file(project_root / "subrepo" / "keep.md", "# keep\n" * 20)
 
-        assert scanned_files(project_root) == ["subrepo/keep.csv"]
+        assert scanned_files(project_root) == ["subrepo/keep.md"]
     finally:
         shutil.rmtree(tmpdir)
 
@@ -131,10 +137,11 @@ def test_scan_project_can_disable_gitignore():
     try:
         project_root = Path(tmpdir).resolve()
 
+        # NB: .md and not .csv — see the note in the nested-gitignore test above.
         write_file(project_root / ".gitignore", "data/\n")
-        write_file(project_root / "data" / "stuff.csv", "a,b,c\n" * 20)
+        write_file(project_root / "data" / "stuff.md", "# stuff\n" * 20)
 
-        assert scanned_files(project_root, respect_gitignore=False) == ["data/stuff.csv"]
+        assert scanned_files(project_root, respect_gitignore=False) == ["data/stuff.md"]
     finally:
         shutil.rmtree(tmpdir)
 

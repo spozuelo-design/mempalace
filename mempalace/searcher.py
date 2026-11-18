@@ -46,9 +46,46 @@ ARCHIVE_COLLECTION = "mempalace_drawers"
 
 # Candidates fetched from the vector index before any re-ranking, regardless
 # of how few results the caller asked for. Feeds the closet-boost stage.
-MIN_RERANK_CANDIDATES = 30
+#
+# Raised 30 -> 100 on 2026-08-31. See RERANK_POOL below for the measurement.
+MIN_RERANK_CANDIDATES = 100
 # How many of those the BM25 re-rank is allowed to reorder. See search_memories().
-RERANK_POOL = 10
+#
+# Raised 10 -> 30 on 2026-08-31, measured against the gauntlet gold-set (20
+# questions anchored to a known source file) on the Windows palace. The old
+# value was tuned on mempalace_bench, a different and much smaller corpus.
+#
+#   overfetch/pool   hit@1    hit@3         hit@5    noise in top-3
+#   30/10 (old)      6/20     9/20 (45%)    9/20     0
+#   60/20            8/20    12/20 (60%)   12/20     0
+#   100/30           8/20    13/20 (65%)   14/20     0
+#   200/50           8/20    12/20 (60%)   14/20     0
+#   200/100          9/20    13/20 (65%)   15/20     0
+#
+# Two things this settles:
+#
+#  1. The old comment feared a large pool would let BM25 drag up lexical
+#     near-misses the vector order had correctly buried. On this gold-set that
+#     does not happen: noise in the top-3 stays at ZERO for every size tried.
+#     The fear was real on mempalace_bench; it does not generalise.
+#  2. The bottleneck was reach, not ranking quality. A separate probe
+#     (gauntlet scripts/profundidad_vectorial.py, n=200, no re-ranking) found
+#     the correct chunk sitting at vector ranks #12, #23, #28, #35, #55, #86
+#     and #102 for questions that were failing. A pool of 10 cannot reach any
+#     of them, however good the re-ranker is.
+#
+# 100/30 over 200/100 deliberately: same hit@3, a third of the BM25 work per
+# query, and less room to be fitting 20 questions. The jump from 30/10 to
+# anything larger is outside the noise; the choice *among* the larger values
+# is not resolved by 20 questions, so do not read 100/30 as an optimum.
+#
+# Before changing these again, re-run the sweep — it takes two minutes:
+#   python <gauntlet>/scripts/barrido_pool.py --k 5
+RERANK_POOL = 30
+# Closets consulted to build the boost lookup. Fixed on purpose — see the long
+# comment in search_memories(). Must be >= RERANK_POOL so the boost can reach
+# every candidate the BM25 stage will reorder.
+CLOSET_BOOST_CANDIDATES = 30
 
 
 def resolve_drawers_collection(palace_path: str, scope: str = "curated"):
@@ -403,12 +440,25 @@ def search_memories(
         return {"error": f"Search error: {e}"}
 
     # Gather closet hits (best-per-source) to build a boost lookup.
+    #
+    # The size is FIXED, not n_results * 2 as it was until 2026-08-31. Scaling
+    # it with the caller's k made the boost table — and therefore the final
+    # ordering — depend on how many results you asked for, so asking for MORE
+    # could hand back FEWER of the right ones. Measured on the gauntlet
+    # gold-set: questions hitting in the top-3 at k=5 vanished entirely at
+    # k=50. A caller who widens k to "see more" expects a superset, not a
+    # reshuffle.
+    #
+    # The boost table is a property of the QUERY, not of the page size, so it
+    # gets a constant. CLOSET_BOOST_CANDIDATES covers the re-rank pool with
+    # room to spare; there is no reason to look at fewer closets just because
+    # the caller wants three results instead of thirty.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
         closets_col = get_closets_collection(palace_path, create=False)
         ckwargs = {
             "query_texts": [query],
-            "n_results": n_results * 2,
+            "n_results": CLOSET_BOOST_CANDIDATES,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -496,6 +546,15 @@ def search_memories(
     # The bounded pool wins at every k the callers actually use and is the only
     # one whose behaviour is stable across k. It gives up 0.003 MRR at k=10
     # against re-ranking n_results, and buys a top-3 hit for it.
+    #
+    # 2026-08-31 — the table above still holds ON mempalace_bench, but its
+    # conclusion did NOT generalise. Re-measured on the Windows palace against
+    # the gauntlet gold-set, the bounded-at-10 pool was the bottleneck: hit@3
+    # 45% at pool 10 vs 65% at pool 30, with noise in the top-3 flat at ZERO for
+    # every size tried. RERANK_POOL is now 30. Details and the full sweep are in
+    # the RERANK_POOL comment at the top of this module. Do not "restore" 10 on
+    # the strength of the mempalace_bench numbers alone — that corpus is much
+    # smaller and does not reproduce the effect.
     pool = scored[: max(n_results, RERANK_POOL)]
     _hybrid_rank(pool, query)
     hits = pool[:n_results]
